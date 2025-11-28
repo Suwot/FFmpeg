@@ -456,7 +456,8 @@ struct init_section_info {
     char byterange[32];
 };
 
-static struct segment *new_init_section(struct playlist *pls,
+static struct segment *new_init_section(HLSContext *c,
+                                        struct playlist *pls,
                                         struct init_section_info *info,
                                         const char *url_base)
 {
@@ -478,7 +479,6 @@ static struct segment *new_init_section(struct playlist *pls,
             av_free(sec);
             return NULL;
         }
-        HLSContext *c = pls->parent->priv_data;
         append_query_if_needed(c, tmp_str, sizeof(tmp_str), pls->base_query);
     }
     sec->url = av_strdup(ptr);
@@ -956,7 +956,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 goto fail;
             ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_init_section_args,
                                &info);
-            cur_init_section = new_init_section(pls, &info, url);
+            cur_init_section = new_init_section(c, pls, &info, url);
             if (!cur_init_section) {
                 ret = AVERROR(ENOMEM);
                 goto fail;
