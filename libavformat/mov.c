@@ -7688,9 +7688,14 @@ static int mov_read_saiz(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     sample_count = avio_rb32(pb);
 
     if (encryption_index->auxiliary_info_default_size == 0) {
-        if (sample_count == 0)
+        if (sample_count == 0) {
+            if (!sc->cenc.per_sample_iv_size) {
+                av_log(c->fc, AV_LOG_DEBUG,
+                       "Ignoring empty saiz box for constant-IV full-sample encryption\n");
+                return 0;
+            }
             return AVERROR_INVALIDDATA;
-
+        }
         encryption_index->auxiliary_info_sizes = av_malloc(sample_count);
         if (!encryption_index->auxiliary_info_sizes)
             return AVERROR(ENOMEM);
