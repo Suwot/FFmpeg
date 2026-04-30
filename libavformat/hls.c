@@ -283,15 +283,29 @@ static void free_init_section_list(struct playlist *pls)
 // Helper function to append query parameters to URL if inheritance is enabled
 static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size, const char *base_query)
 {
+    char fragment_suffix[MAX_URL_SIZE];
+    char reordered_url[MAX_URL_SIZE];
+    char *fragment;
+
     if (!c->inherit_query_params || !base_query)
         return;
 
-    // Check if URL already has a query
     if (strchr(url_buf, '?'))
         return;
 
-    // Append the base query
-    av_strlcat(url_buf, base_query, buf_size);
+    fragment = strchr(url_buf, '#');
+    if (!fragment) {
+        av_strlcat(url_buf, base_query, buf_size);
+        return;
+    }
+
+    av_strlcpy(fragment_suffix, fragment, sizeof(fragment_suffix));
+    *fragment = '\0';
+
+    av_strlcpy(reordered_url, url_buf, sizeof(reordered_url));
+    av_strlcat(reordered_url, base_query, sizeof(reordered_url));
+    av_strlcat(reordered_url, fragment_suffix, sizeof(reordered_url));
+    av_strlcpy(url_buf, reordered_url, buf_size);
 }
 
 static const char *const HLS_CUSTOM_KEY_SENTINEL = "custom_decryption_key";
@@ -1491,8 +1505,13 @@ static void intercept_id3(struct playlist *pls, uint8_t *buf,
 static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
 {
     AVIOContext *pb = NULL;
+    AVDictionary *opts = NULL;
+    int ret;
 
-    int ret = open_url(pls->parent, &pb, seg->key, &c->avio_opts, NULL, NULL);
+    av_dict_set(&opts, "seekable", "0", 0);
+
+    ret = open_url(pls->parent, &pb, seg->key, &c->avio_opts, opts, NULL);
+    av_dict_free(&opts);
     if (ret < 0) {
         av_log(pls->parent, AV_LOG_ERROR, "Unable to open key file %s, %s\n",
                seg->key, av_err2str(ret));
@@ -2434,7 +2453,6 @@ static int hls_read_header(AVFormatContext *s)
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
         const AVInputFormat *in_fmt = NULL;
-        char *url;
         AVDictionary *options = NULL;
         struct segment *seg = NULL;
 
@@ -2525,8 +2543,7 @@ static int hls_read_header(AVFormatContext *s)
             pls->ctx->probesize = s->probesize > 0 ? s->probesize : 1024 * 4;
             pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
             pls->ctx->interrupt_callback = s->interrupt_callback;
-            url = av_strdup(pls->segments[0]->url);
-            ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
+            ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, "", NULL, 0, 0);
 
             for (int n = 0; n < pls->n_segments; n++)
                 if (ret >= 0)
@@ -2537,13 +2554,12 @@ static int hls_read_header(AVFormatContext *s)
                 * so avformat_close_input shouldn't be called. If
                 * avformat_open_input fails below, it frees and zeros the
                 * context, so it doesn't need any special treatment like this. */
-                av_log(s, AV_LOG_ERROR, "Error when loading first segment '%s'\n", url);
+                av_log(s, AV_LOG_ERROR, "Error when loading first segment '%s'\n",
+                       seg ? seg->url : "");
                 avformat_free_context(pls->ctx);
                 pls->ctx = NULL;
-                av_free(url);
                 return ret;
             }
-            av_free(url);
         }
 
         seg = current_segment(pls);
