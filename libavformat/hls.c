@@ -280,32 +280,60 @@ static void free_init_section_list(struct playlist *pls)
     pls->n_init_sections = 0;
 }
 
-// Helper function to append query parameters to URL if inheritance is enabled
-static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size, const char *base_query)
+static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size,
+                                   const char *base_query)
 {
-    char fragment_suffix[MAX_URL_SIZE];
     char reordered_url[MAX_URL_SIZE];
+    char *query;
     char *fragment;
+    size_t prefix_len, query_len, fragment_len;
 
     if (!c->inherit_query_params || !base_query)
         return;
 
-    if (strchr(url_buf, '?'))
+    query = strchr(url_buf, '?');
+    fragment = strchr(url_buf, '#');
+    if (query && (!fragment || query < fragment))
         return;
 
-    fragment = strchr(url_buf, '#');
+    query_len = strlen(base_query);
     if (!fragment) {
+        prefix_len = strlen(url_buf);
+        if (prefix_len + query_len + 1 > buf_size)
+            return;
         av_strlcat(url_buf, base_query, buf_size);
         return;
     }
 
-    av_strlcpy(fragment_suffix, fragment, sizeof(fragment_suffix));
-    *fragment = '\0';
+    prefix_len = fragment - url_buf;
+    fragment_len = strlen(fragment);
+    if (prefix_len + query_len + fragment_len + 1 > sizeof(reordered_url) ||
+        prefix_len + query_len + fragment_len + 1 > buf_size)
+        return;
 
-    av_strlcpy(reordered_url, url_buf, sizeof(reordered_url));
-    av_strlcat(reordered_url, base_query, sizeof(reordered_url));
-    av_strlcat(reordered_url, fragment_suffix, sizeof(reordered_url));
+    memcpy(reordered_url, url_buf, prefix_len);
+    memcpy(reordered_url + prefix_len, base_query, query_len);
+    memcpy(reordered_url + prefix_len + query_len, fragment, fragment_len + 1);
     av_strlcpy(url_buf, reordered_url, buf_size);
+}
+
+static char *dup_url_query_without_fragment(const char *url)
+{
+    const char *query;
+    const char *fragment;
+
+    if (!url)
+        return NULL;
+
+    query = strchr(url, '?');
+    if (!query)
+        return NULL;
+
+    fragment = strchr(query, '#');
+    if (fragment)
+        return av_strndup(query, fragment - query);
+
+    return av_strdup(query);
 }
 
 static const char *const HLS_CUSTOM_KEY_SENTINEL = "custom_decryption_key";
@@ -408,17 +436,16 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
 
-    // Inherit query parameters if enabled
     if (c->inherit_query_params) {
-        const char *query_start = strchr(pls->url, '?');
-        if (query_start) {
-            // This playlist has its own query, use it
-            pls->base_query = av_strdup(query_start);
-        } else if (c->root_query) {
-            // Inherit from root
-            pls->base_query = av_strdup(c->root_query);
+        pls->base_query = dup_url_query_without_fragment(pls->url);
+        if (!pls->base_query && strchr(pls->url, '?')) {
+            av_packet_free(&pls->pkt);
+            av_free(pls);
+            return NULL;
         }
-        if (pls->base_query == NULL && (query_start || c->root_query)) {
+        if (!pls->base_query && c->root_query)
+            pls->base_query = av_strdup(c->root_query);
+        if (!pls->base_query && c->root_query) {
             av_packet_free(&pls->pkt);
             av_free(pls);
             return NULL;
@@ -2336,14 +2363,10 @@ static int hls_read_header(AVFormatContext *s)
     c->first_timestamp = AV_NOPTS_VALUE;
     c->cur_timestamp = AV_NOPTS_VALUE;
 
-    // Parse root URL and extract query for inheritance
     if (c->inherit_query_params) {
-        const char *query_start = strchr(s->url, '?');
-        if (query_start) {
-            c->root_query = av_strdup(query_start);
-            if (!c->root_query)
-                return AVERROR(ENOMEM);
-        }
+        c->root_query = dup_url_query_without_fragment(s->url);
+        if (!c->root_query && strchr(s->url, '?'))
+            return AVERROR(ENOMEM);
     }
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
