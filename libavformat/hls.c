@@ -175,8 +175,6 @@ struct playlist {
     struct segment **init_sections;
     int is_subtitle; /* Indicates if it's a subtitle playlist */
 
-    // HLS query parameter inheritance
-    char *base_query;
 };
 
 /*
@@ -245,9 +243,7 @@ typedef struct HLSContext {
     uint8_t custom_key[16];
     uint8_t custom_iv[16];
 
-    // HLS query parameter inheritance
-    int inherit_query_params;
-    char *root_query;
+    char *append_query;
     int ignore_hier_sidx; // if set, forward MOV option to ignore hierarchical SIDX
 } HLSContext;
 
@@ -280,28 +276,47 @@ static void free_init_section_list(struct playlist *pls)
     pls->n_init_sections = 0;
 }
 
-static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size,
-                                   const char *base_query)
+static void append_query_string(char *url_buf, size_t buf_size,
+                                const char *append_query)
 {
     char reordered_url[MAX_URL_SIZE];
+    const char *query_suffix = append_query;
     char *query;
     char *fragment;
-    size_t prefix_len, query_len, fragment_len;
+    size_t prefix_len, query_len, fragment_len, suffix_len;
+    char separator = 0;
+    int has_query;
 
-    if (!c->inherit_query_params || !base_query)
+    if (!append_query || !*append_query)
         return;
 
-    query = strchr(url_buf, '?');
     fragment = strchr(url_buf, '#');
-    if (query && (!fragment || query < fragment))
-        return;
+    query = strchr(url_buf, '?');
+    has_query = query && (!fragment || query < fragment);
 
-    query_len = strlen(base_query);
+    if (has_query && append_query[0] == '?') {
+        if (!append_query[1])
+            return;
+        separator = '&';
+        query_suffix = append_query + 1;
+    } else if (!has_query && append_query[0] == '&') {
+        if (!append_query[1])
+            return;
+        separator = '?';
+        query_suffix = append_query + 1;
+    }
+
+    suffix_len = strlen(query_suffix);
+    query_len = suffix_len + (separator ? 1 : 0);
     if (!fragment) {
         prefix_len = strlen(url_buf);
         if (prefix_len + query_len + 1 > buf_size)
             return;
-        av_strlcat(url_buf, base_query, buf_size);
+        if (separator) {
+            url_buf[prefix_len] = separator;
+            url_buf[prefix_len + 1] = '\0';
+        }
+        av_strlcat(url_buf, query_suffix, buf_size);
         return;
     }
 
@@ -312,28 +327,11 @@ static void append_query_if_needed(HLSContext *c, char *url_buf, size_t buf_size
         return;
 
     memcpy(reordered_url, url_buf, prefix_len);
-    memcpy(reordered_url + prefix_len, base_query, query_len);
-    memcpy(reordered_url + prefix_len + query_len, fragment, fragment_len + 1);
+    if (separator)
+        reordered_url[prefix_len++] = separator;
+    memcpy(reordered_url + prefix_len, query_suffix, suffix_len);
+    memcpy(reordered_url + prefix_len + suffix_len, fragment, fragment_len + 1);
     av_strlcpy(url_buf, reordered_url, buf_size);
-}
-
-static char *dup_url_query_without_fragment(const char *url)
-{
-    const char *query;
-    const char *fragment;
-
-    if (!url)
-        return NULL;
-
-    query = strchr(url, '?');
-    if (!query)
-        return NULL;
-
-    fragment = strchr(query, '#');
-    if (fragment)
-        return av_strndup(query, fragment - query);
-
-    return av_strdup(query);
 }
 
 static const char *const HLS_CUSTOM_KEY_SENTINEL = "custom_decryption_key";
@@ -386,7 +384,6 @@ static void free_playlist_list(HLSContext *c)
             pls->ctx->pb = NULL;
             avformat_close_input(&pls->ctx);
         }
-        av_freep(&pls->base_query);
         av_free(pls);
     }
     av_freep(&c->playlists);
@@ -431,26 +428,12 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
         av_free(pls);
         return NULL;
     }
+    if (base)
+        append_query_string(pls->url, sizeof(pls->url), c->append_query);
     pls->seek_timestamp = AV_NOPTS_VALUE;
 
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
-
-    if (c->inherit_query_params) {
-        pls->base_query = dup_url_query_without_fragment(pls->url);
-        if (!pls->base_query && strchr(pls->url, '?')) {
-            av_packet_free(&pls->pkt);
-            av_free(pls);
-            return NULL;
-        }
-        if (!pls->base_query && c->root_query)
-            pls->base_query = av_strdup(c->root_query);
-        if (!pls->base_query && c->root_query) {
-            av_packet_free(&pls->pkt);
-            av_free(pls);
-            return NULL;
-        }
-    }
 
     dynarray_add(&c->playlists, &c->n_playlists, pls);
     return pls;
@@ -557,7 +540,7 @@ static struct segment *new_init_section(HLSContext *c,
             av_free(sec);
             return NULL;
         }
-        append_query_if_needed(c, tmp_str, sizeof(tmp_str), pls->base_query);
+        append_query_string(tmp_str, sizeof(tmp_str), c->append_query);
     }
     sec->url = av_strdup(ptr);
     if (!sec->url) {
@@ -1059,6 +1042,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                     ret = AVERROR_INVALIDDATA;
                     goto fail;
                 }
+                append_query_string(tmp_str, sizeof(tmp_str), c->append_query);
                 cur_init_section->key = av_strdup(tmp_str);
                 if (!cur_init_section->key) {
                     av_free(cur_init_section);
@@ -1131,6 +1115,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                         av_free(seg);
                         goto fail;
                     }
+                    append_query_string(tmp_str, sizeof(tmp_str), c->append_query);
                     seg->key = av_strdup(tmp_str);
                     if (!seg->key) {
                         av_free(seg);
@@ -1149,7 +1134,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                     av_free(seg);
                     goto fail;
                 }
-                append_query_if_needed(c, tmp_str, sizeof(tmp_str), pls->base_query);
+                append_query_string(tmp_str, sizeof(tmp_str), c->append_query);
                 seg->url = av_strdup(tmp_str);
                 if (!seg->url) {
                     av_free(seg->key);
@@ -2343,7 +2328,7 @@ static int hls_close(AVFormatContext *s)
 
     av_dict_free(&c->avio_opts);
     ff_format_io_close(c->ctx, &c->playlist_pb);
-    av_freep(&c->root_query);
+    av_freep(&c->append_query);
     av_freep(&c->custom_decryption_key_str);
     av_freep(&c->custom_iv_str);
 
@@ -2362,12 +2347,6 @@ static int hls_read_header(AVFormatContext *s)
     c->first_packet = 1;
     c->first_timestamp = AV_NOPTS_VALUE;
     c->cur_timestamp = AV_NOPTS_VALUE;
-
-    if (c->inherit_query_params) {
-        c->root_query = dup_url_query_without_fragment(s->url);
-        if (!c->root_query && strchr(s->url, '?'))
-            return AVERROR(ENOMEM);
-    }
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -3084,8 +3063,8 @@ static const AVOption hls_options[] = {
      OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
     {"skip_png_bytes", "Skip PNG wrapper at start of each segment",
      OFFSET(skip_png_bytes), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
-    {"hls_inherit_query_params", "Inherit query parameters from root URL to relative URIs",
-     OFFSET(inherit_query_params), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
+    {"append_query", "Append this query string to child playlist, segment, init section, and key URIs",
+     OFFSET(append_query), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
     {"ignore_hier_sidx",
      "Forward hierarchical SIDX tolerance to nested demuxers (MOV). Default off.",
      OFFSET(ignore_hier_sidx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
