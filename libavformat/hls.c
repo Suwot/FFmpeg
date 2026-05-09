@@ -2599,6 +2599,36 @@ static int hls_read_header(AVFormatContext *s)
         if (ret < 0)
             return ret;
 
+        if (s->bit_rate <= 0 && c->n_variants == 1) {
+            struct variant *v = c->variants[0];
+            int64_t inferred_bitrate = 0;
+            const char *bitrate_source = NULL;
+
+            if (!v->bandwidth && v->n_playlists == 1 && v->playlists[0] == pls) {
+                if (seg && seg->size < 0) {
+                    int64_t segment_size = avio_size(pls->input);
+
+                    if (segment_size > 0)
+                        seg->size = segment_size;
+                }
+
+                inferred_bitrate = pls->ctx->bit_rate;
+                bitrate_source = "subdemuxer";
+
+                if (inferred_bitrate <= 0 && seg && seg->size > 0 && seg->duration > 0) {
+                    inferred_bitrate = av_rescale(seg->size, 8LL * AV_TIME_BASE, seg->duration);
+                    bitrate_source = "segment";
+                }
+            }
+
+            if (inferred_bitrate > 0) {
+                s->bit_rate = inferred_bitrate;
+                av_log(s, AV_LOG_DEBUG,
+                       "Using HLS %s bitrate as input bitrate: bitrate=%"PRId64"\n",
+                       bitrate_source, s->bit_rate);
+            }
+        }
+
         if (pls->id3_deferred_extra && pls->ctx->nb_streams == 1) {
             ff_id3v2_parse_apic(pls->ctx, pls->id3_deferred_extra);
             avformat_queue_attached_pictures(pls->ctx);
