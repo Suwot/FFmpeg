@@ -723,12 +723,13 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
 {
     char *tmp_str = NULL;
     char *path = NULL;
-    char *mpdName = NULL;
     xmlNodePtr node = NULL;
     char *baseurl = NULL;
     char *root_url = NULL;
     char *text = NULL;
-    char *tmp = NULL;
+    const char *path_end;
+    const char *last_slash = NULL;
+    const char *p;
     int isRootHttp = 0;
     char token ='/';
     int start =  0;
@@ -751,17 +752,13 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
     }
 
     tmp_max_url_size = aligned(tmp_max_url_size);
-    text = av_mallocz(tmp_max_url_size + 1);
-    if (!text) {
-        updated = AVERROR(ENOMEM);
-        goto end;
+    path_end = strpbrk(url, "?#");
+    if (!path_end)
+        path_end = url + strlen(url);
+    for (p = url; p < path_end; p++) {
+        if (*p == '/')
+            last_slash = p;
     }
-    av_strlcpy(text, url, strlen(url)+1);
-    tmp = text;
-    while (mpdName = av_strtok(tmp, "/", &tmp))  {
-        size = strlen(mpdName);
-    }
-    av_free(text);
 
     path = av_mallocz(tmp_max_url_size + 2);
     tmp_str = av_mallocz(tmp_max_url_size);
@@ -770,7 +767,8 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
         goto end;
     }
 
-    av_strlcpy (path, url, strlen(url) - size + 1);
+    if (last_slash)
+        av_strlcpy(path, url, last_slash - url + 2);
     for (rootId = n_baseurl_nodes - 1; rootId > 0; rootId --) {
         if (!(node = baseurl_nodes[rootId])) {
             continue;
