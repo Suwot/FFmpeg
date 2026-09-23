@@ -119,6 +119,8 @@ struct representation {
     uint32_t init_sec_buf_read_offset;
     int64_t cur_timestamp;
     int is_restart_needed;
+    int init_failed;
+    int init_error;
 };
 
 typedef struct DASHContext {
@@ -1964,7 +1966,8 @@ fail:
     return ret;
 }
 
-static int open_demux_for_component(AVFormatContext *s, struct representation *pls)
+static int open_demux_for_component(AVFormatContext *s, struct representation *pls,
+                                    enum AVMediaType type)
 {
     int ret = 0;
     int i;
@@ -1976,8 +1979,28 @@ static int open_demux_for_component(AVFormatContext *s, struct representation *p
         pls->last_seq_no = calc_max_seg_no(pls, s->priv_data);
 
     ret = reopen_demux_for_component(s, pls);
-    if (ret < 0)
-        return ret;
+    if (ret < 0) {
+        if (ret == AVERROR(ENOMEM) || ret == AVERROR_EXIT)
+            return ret;
+
+        if (pls->ctx)
+            close_demux_for_component(pls);
+        else
+            av_freep(&pls->pb.pub.buffer);
+        ff_format_io_close(pls->parent, &pls->input);
+
+        pls->init_failed = 1;
+        pls->init_error = ret;
+        AVStream *st = avformat_new_stream(s, NULL);
+        if (!st)
+            return AVERROR(ENOMEM);
+        st->id = pls->stream_index;
+        st->codecpar->codec_type = type;
+        st->discard = AVDISCARD_ALL;
+        return 0;
+    }
+    pls->init_failed = 0;
+    pls->init_error = 0;
 
     for (i = 0; i < pls->ctx->nb_streams; i++) {
         AVStream *st = avformat_new_stream(s, NULL);
@@ -2057,6 +2080,7 @@ static int dash_read_header(AVFormatContext *s)
     AVProgram *program;
     int ret = 0;
     int stream_index = 0;
+    int initialized = 0;
     int i;
 
     c->interrupt_callback = &s->interrupt_callback;
@@ -2087,11 +2111,12 @@ static int dash_read_header(AVFormatContext *s)
                 return ret;
         }
         rep->stream_index = stream_index;
-        ret = open_demux_for_component(s, rep);
+        ret = open_demux_for_component(s, rep, AVMEDIA_TYPE_VIDEO);
 
         if (ret)
             return ret;
-        stream_index += rep->ctx->nb_streams;
+        initialized |= !!rep->ctx;
+        stream_index += rep->ctx ? rep->ctx->nb_streams : 1;
     }
 
     if(c->n_audios)
@@ -2105,11 +2130,12 @@ static int dash_read_header(AVFormatContext *s)
                 return ret;
         }
         rep->stream_index = stream_index;
-        ret = open_demux_for_component(s, rep);
+        ret = open_demux_for_component(s, rep, AVMEDIA_TYPE_AUDIO);
 
         if (ret)
             return ret;
-        stream_index += rep->ctx->nb_streams;
+        initialized |= !!rep->ctx;
+        stream_index += rep->ctx ? rep->ctx->nb_streams : 1;
     }
 
     if (c->n_subtitles)
@@ -2123,14 +2149,15 @@ static int dash_read_header(AVFormatContext *s)
                 return ret;
         }
         rep->stream_index = stream_index;
-        ret = open_demux_for_component(s, rep);
+        ret = open_demux_for_component(s, rep, AVMEDIA_TYPE_SUBTITLE);
 
         if (ret)
             return ret;
-        stream_index += rep->ctx->nb_streams;
+        initialized |= !!rep->ctx;
+        stream_index += rep->ctx ? rep->ctx->nb_streams : 1;
     }
 
-    if (!stream_index)
+    if (!stream_index || !initialized)
         return AVERROR_INVALIDDATA;
 
     /* Create a program */
@@ -2140,11 +2167,12 @@ static int dash_read_header(AVFormatContext *s)
 
     for (i = 0; i < c->n_videos; i++) {
         rep = c->videos[i];
-        rep->assoc_stream = av_malloc_array(rep->ctx->nb_streams, sizeof(*rep->assoc_stream));
+        int nb_streams = rep->ctx ? rep->ctx->nb_streams : 1;
+        rep->assoc_stream = av_malloc_array(nb_streams, sizeof(*rep->assoc_stream));
         if (!rep->assoc_stream)
             return AVERROR(ENOMEM);
-        rep->nb_assoc_stream = rep->ctx->nb_streams;
-        for (int j = 0; j < rep->ctx->nb_streams; j++) {
+        rep->nb_assoc_stream = nb_streams;
+        for (int j = 0; j < nb_streams; j++) {
             av_program_add_stream_index(s, 0, rep->stream_index + j);
             rep->assoc_stream[j] = s->streams[rep->stream_index + j];
         }
@@ -2154,11 +2182,12 @@ static int dash_read_header(AVFormatContext *s)
     }
     for (i = 0; i < c->n_audios; i++) {
         rep = c->audios[i];
-        rep->assoc_stream = av_malloc_array(rep->ctx->nb_streams, sizeof(*rep->assoc_stream));
+        int nb_streams = rep->ctx ? rep->ctx->nb_streams : 1;
+        rep->assoc_stream = av_malloc_array(nb_streams, sizeof(*rep->assoc_stream));
         if (!rep->assoc_stream)
             return AVERROR(ENOMEM);
-        rep->nb_assoc_stream = rep->ctx->nb_streams;
-        for (int j = 0; j < rep->ctx->nb_streams; j++) {
+        rep->nb_assoc_stream = nb_streams;
+        for (int j = 0; j < nb_streams; j++) {
             av_program_add_stream_index(s, 0, rep->stream_index + j);
             rep->assoc_stream[j] = s->streams[rep->stream_index + j];
         }
@@ -2169,11 +2198,12 @@ static int dash_read_header(AVFormatContext *s)
     }
     for (i = 0; i < c->n_subtitles; i++) {
         rep = c->subtitles[i];
-        rep->assoc_stream = av_malloc_array(rep->ctx->nb_streams, sizeof(*rep->assoc_stream));
+        int nb_streams = rep->ctx ? rep->ctx->nb_streams : 1;
+        rep->assoc_stream = av_malloc_array(nb_streams, sizeof(*rep->assoc_stream));
         if (!rep->assoc_stream)
             return AVERROR(ENOMEM);
-        rep->nb_assoc_stream = rep->ctx->nb_streams;
-        for (int j = 0; j < rep->ctx->nb_streams; j++) {
+        rep->nb_assoc_stream = nb_streams;
+        for (int j = 0; j < nb_streams; j++) {
             av_program_add_stream_index(s, 0, rep->stream_index + j);
             rep->assoc_stream[j] = s->streams[rep->stream_index + j];
         }
@@ -2195,14 +2225,26 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
         for (int j = 0; j < pls->nb_assoc_stream; j++)
             needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
 
-        if (needed && !pls->ctx) {
+        if (needed && !pls->ctx && !pls->init_failed) {
             pls->cur_seg_offset = 0;
             pls->init_sec_buf_read_offset = 0;
             /* Catch up */
             for (j = 0; j < n; j++) {
                 pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
             }
-            reopen_demux_for_component(s, pls);
+            int ret = reopen_demux_for_component(s, pls);
+            if (ret < 0) {
+                if (pls->ctx)
+                    close_demux_for_component(pls);
+                else
+                    av_freep(&pls->pb.pub.buffer);
+                ff_format_io_close(pls->parent, &pls->input);
+                pls->init_failed = 1;
+                pls->init_error = ret;
+            } else {
+                pls->init_failed = 0;
+                pls->init_error = 0;
+            }
             av_log(s, AV_LOG_INFO, "Now receiving stream_index %d\n", pls->stream_index);
         } else if (!needed && pls->ctx) {
             close_demux_for_component(pls);
@@ -2210,6 +2252,21 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
             av_log(s, AV_LOG_INFO, "No longer receiving stream_index %d\n", pls->stream_index);
         }
     }
+}
+
+static int check_representation_failures(struct representation **p, int n)
+{
+    for (int i = 0; i < n; i++) {
+        struct representation *pls = p[i];
+
+        if (!pls->init_failed)
+            continue;
+        for (int j = 0; j < pls->nb_assoc_stream; j++) {
+            if (pls->assoc_stream[j]->discard < AVDISCARD_ALL)
+                return pls->init_error;
+        }
+    }
+    return 0;
 }
 
 static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -2223,6 +2280,14 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
     recheck_discard_flags(s, c->videos, c->n_videos);
     recheck_discard_flags(s, c->audios, c->n_audios);
     recheck_discard_flags(s, c->subtitles, c->n_subtitles);
+
+    ret = check_representation_failures(c->videos, c->n_videos);
+    if (!ret)
+        ret = check_representation_failures(c->audios, c->n_audios);
+    if (!ret)
+        ret = check_representation_failures(c->subtitles, c->n_subtitles);
+    if (ret < 0)
+        return ret;
 
     for (i = 0; i < c->n_videos; i++) {
         rep = c->videos[i];
