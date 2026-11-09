@@ -205,6 +205,8 @@ typedef struct SchMuxStream {
     /* dts+duration of the last packet sent to this stream
        in AV_TIME_BASE_Q */
     int64_t             last_dts;
+    /* DTS of the first packet sent to this stream, in AV_TIME_BASE_Q */
+    int64_t             first_dts;
     // this stream no longer accepts input
     int                 source_finished;
     ////////////////////////////////////////////////////////////
@@ -456,6 +458,29 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
     return min_dts == INT64_MAX ? AV_NOPTS_VALUE : min_dts;
 }
 
+static int64_t progress_origin(const Scheduler *sch)
+{
+    int64_t origin = INT64_MAX;
+
+    for (unsigned i = 0; i < sch->nb_mux; i++) {
+        const SchMux *mux = &sch->mux[i];
+
+        for (unsigned j = 0; j < mux->nb_streams; j++) {
+            const SchMuxStream *ms = &mux->streams[j];
+
+            if (ms->first_dts == AV_NOPTS_VALUE) {
+                if (!ms->source_finished)
+                    return AV_NOPTS_VALUE;
+                continue;
+            }
+
+            origin = FFMIN(origin, ms->first_dts);
+        }
+    }
+
+    return origin == INT64_MAX ? AV_NOPTS_VALUE : origin;
+}
+
 void sch_free(Scheduler **psch)
 {
     Scheduler *sch = *psch;
@@ -463,7 +488,7 @@ void sch_free(Scheduler **psch)
     if (!sch)
         return;
 
-    sch_stop(sch, NULL);
+    sch_stop(sch, NULL, NULL);
 
     for (unsigned i = 0; i < sch->nb_demux; i++) {
         SchDemux *d = &sch->demux[i];
@@ -667,6 +692,7 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
         return AVERROR(ENOMEM);
 
     ms->last_dts = AV_NOPTS_VALUE;
+    ms->first_dts = AV_NOPTS_VALUE;
 
     return stream_idx;
 }
@@ -1650,11 +1676,12 @@ int sch_start(Scheduler *sch)
 
     return 0;
 fail:
-    sch_stop(sch, NULL);
+    sch_stop(sch, NULL, NULL);
     return ret;
 }
 
-int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts)
+int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts,
+             int64_t *transcode_ts_copyts)
 {
     int ret;
 
@@ -1674,7 +1701,14 @@ int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts)
 
     pthread_mutex_unlock(&sch->finish_lock);
 
+    pthread_mutex_lock(&sch->schedule_lock);
     *transcode_ts = atomic_load(&sch->last_dts);
+    if (transcode_ts_copyts) {
+        int64_t origin = progress_origin(sch);
+        *transcode_ts_copyts = *transcode_ts == AV_NOPTS_VALUE || origin == AV_NOPTS_VALUE ?
+                               AV_NOPTS_VALUE : *transcode_ts - origin;
+    }
+    pthread_mutex_unlock(&sch->schedule_lock);
 
     return ret;
 }
@@ -1860,6 +1894,8 @@ static int send_to_mux(Scheduler *sch, SchMux *mux, unsigned stream_idx,
                        AVPacket *pkt)
 {
     SchMuxStream *ms = &mux->streams[stream_idx];
+    int64_t start_dts = (pkt && pkt->dts != AV_NOPTS_VALUE) ?
+                        av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q) : AV_NOPTS_VALUE;
     int64_t dts = (pkt && pkt->dts != AV_NOPTS_VALUE)                                    ?
                   av_rescale_q(pkt->dts + pkt->duration, pkt->time_base, AV_TIME_BASE_Q) :
                   AV_NOPTS_VALUE;
@@ -1903,7 +1939,11 @@ update_schedule:
     if (dts != AV_NOPTS_VALUE || !pkt) {
         pthread_mutex_lock(&sch->schedule_lock);
 
-        if (pkt) ms->last_dts = dts;
+        if (pkt) {
+            if (ms->first_dts == AV_NOPTS_VALUE && start_dts != AV_NOPTS_VALUE)
+                ms->first_dts = start_dts;
+            ms->last_dts = dts;
+        }
         else     ms->source_finished = 1;
 
         schedule_update_locked(sch);
@@ -2572,7 +2612,7 @@ static int task_stop(Scheduler *sch, SchTask *task)
     return (intptr_t)thread_ret;
 }
 
-int sch_stop(Scheduler *sch, int64_t *finish_ts)
+int sch_stop(Scheduler *sch, int64_t *finish_ts, int64_t *finish_ts_copyts)
 {
     int ret = 0, err;
 
@@ -2622,8 +2662,18 @@ int sch_stop(Scheduler *sch, int64_t *finish_ts)
         ret = err_merge(ret, err);
     }
 
-    if (finish_ts)
-        *finish_ts = trailing_dts(sch, 1);
+    if (finish_ts || finish_ts_copyts) {
+        pthread_mutex_lock(&sch->schedule_lock);
+        if (finish_ts)
+            *finish_ts = trailing_dts(sch, 1);
+        if (finish_ts_copyts) {
+            int64_t ts = trailing_dts(sch, 1);
+            int64_t origin = progress_origin(sch);
+            *finish_ts_copyts = ts == AV_NOPTS_VALUE || origin == AV_NOPTS_VALUE ?
+                                AV_NOPTS_VALUE : ts - origin;
+        }
+        pthread_mutex_unlock(&sch->schedule_lock);
+    }
 
     sch->state = SCH_STATE_STOPPED;
 

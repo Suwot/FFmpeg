@@ -139,7 +139,6 @@ static volatile int received_sigterm = 0;
 static volatile int received_nb_signals = 0;
 static atomic_int transcode_init_done = 0;
 static volatile int ffmpeg_exited = 0;
-static int64_t copy_ts_first_pts = AV_NOPTS_VALUE;
 
 static void
 sigterm_handler(int sig)
@@ -618,13 +617,6 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         }
     }
 
-    if (copy_ts) {
-        if (copy_ts_first_pts == AV_NOPTS_VALUE && pts > 1)
-            copy_ts_first_pts = pts;
-        if (copy_ts_first_pts != AV_NOPTS_VALUE)
-            pts -= copy_ts_first_pts;
-    }
-
     us    = FFABS64U(pts) % AV_TIME_BASE;
     secs  = FFABS64U(pts) / AV_TIME_BASE % 60;
     mins  = FFABS64U(pts) / AV_TIME_BASE / 60 % 60;
@@ -870,7 +862,7 @@ static int check_keyboard_interaction(int64_t cur_time)
 static int transcode(Scheduler *sch)
 {
     int ret = 0;
-    int64_t timer_start, transcode_ts = 0;
+    int64_t timer_start, transcode_ts = 0, transcode_ts_copyts = AV_NOPTS_VALUE;
 
     print_stream_maps();
 
@@ -886,7 +878,7 @@ static int transcode(Scheduler *sch)
 
     timer_start = av_gettime_relative();
 
-    while (!sch_wait(sch, stats_period, &transcode_ts)) {
+    while (!sch_wait(sch, stats_period, &transcode_ts, &transcode_ts_copyts)) {
         int64_t cur_time= av_gettime_relative();
 
         if (received_nb_signals)
@@ -898,10 +890,11 @@ static int transcode(Scheduler *sch)
                 break;
 
         /* dump report by using the output first video and audio streams */
-        print_report(0, timer_start, cur_time, transcode_ts);
+        print_report(0, timer_start, cur_time,
+                     copy_ts ? transcode_ts_copyts : transcode_ts);
     }
 
-    ret = sch_stop(sch, &transcode_ts);
+    ret = sch_stop(sch, &transcode_ts, &transcode_ts_copyts);
 
     /* write the trailer if needed */
     for (int i = 0; i < nb_output_files; i++) {
@@ -912,7 +905,8 @@ static int transcode(Scheduler *sch)
     term_exit();
 
     /* dump report by using the first video and audio streams */
-    print_report(1, timer_start, av_gettime_relative(), transcode_ts);
+    print_report(1, timer_start, av_gettime_relative(),
+                 copy_ts ? transcode_ts_copyts : transcode_ts);
 
     return ret;
 }

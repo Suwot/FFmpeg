@@ -212,6 +212,7 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     AVFormatContext *s = mux->fc;
     int64_t fs;
     uint64_t frame_num;
+    int64_t pts = AV_NOPTS_VALUE, duration = 0;
     int ret;
 
     fs = filesize(s->pb);
@@ -229,6 +230,8 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     frame_num = atomic_fetch_add(&ost->packets_written, 1);
 
     pkt->stream_index = ost->index;
+    pts = pkt->pts;
+    duration = pkt->duration;
 
     if (ms->stats.io)
         enc_stats_write(ost, &ms->stats, NULL, pkt, frame_num);
@@ -239,6 +242,23 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
                "Error submitting a packet to the muxer: %s\n",
                av_err2str(ret));
         goto fail;
+    }
+
+    if (pts != AV_NOPTS_VALUE) {
+        int64_t start_us = av_rescale_q(pts, ost->st->time_base, AV_TIME_BASE_Q);
+
+        if (!mux->have_presentation_start || start_us < mux->min_presentation_ts)
+            mux->min_presentation_ts = start_us;
+        mux->have_presentation_start = 1;
+
+        if (duration > 0) {
+            int64_t end = pts + duration;
+            int64_t end_us = av_rescale_q(end, ost->st->time_base, AV_TIME_BASE_Q);
+
+            if (!mux->have_presentation_end || end_us > mux->max_presentation_end)
+                mux->max_presentation_end = end_us;
+            mux->have_presentation_end = 1;
+        }
     }
 
     return 0;
@@ -743,15 +763,27 @@ static void mux_final_stats(Muxer *mux)
                  100.0 * (file_size - total_size) / total_size);
     }
 
-    av_log(of, AV_LOG_INFO,
-           "video:%1.0fKiB audio:%1.0fKiB subtitle:%1.0fKiB other streams:%1.0fKiB "
-           "global headers:%1.0fKiB muxing overhead: %s\n",
-           video_size    / 1024.0,
-           audio_size    / 1024.0,
-           subtitle_size / 1024.0,
-           other_size    / 1024.0,
-           extra_size    / 1024.0,
-           overhead);
+    if (mux->have_presentation_start && mux->have_presentation_end)
+        av_log(of, AV_LOG_INFO,
+               "video:%1.0fKiB audio:%1.0fKiB subtitle:%1.0fKiB other streams:%1.0fKiB "
+               "duration_us:%"PRId64" global headers:%1.0fKiB muxing overhead: %s\n",
+               video_size    / 1024.0,
+               audio_size    / 1024.0,
+               subtitle_size / 1024.0,
+               other_size    / 1024.0,
+               mux->max_presentation_end - mux->min_presentation_ts,
+               extra_size    / 1024.0,
+               overhead);
+    else
+        av_log(of, AV_LOG_INFO,
+               "video:%1.0fKiB audio:%1.0fKiB subtitle:%1.0fKiB other streams:%1.0fKiB "
+               "global headers:%1.0fKiB muxing overhead: %s\n",
+               video_size    / 1024.0,
+               audio_size    / 1024.0,
+               subtitle_size / 1024.0,
+               other_size    / 1024.0,
+               extra_size    / 1024.0,
+               overhead);
 }
 
 int of_write_trailer(OutputFile *of)

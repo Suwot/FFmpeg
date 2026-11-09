@@ -134,7 +134,7 @@ Scheduler *sch_alloc(void);
 void sch_free(Scheduler **sch);
 
 int sch_start(Scheduler *sch);
-int sch_stop(Scheduler *sch, int64_t *finish_ts);
+int sch_stop(Scheduler *sch, int64_t *finish_ts, int64_t *finish_ts_copyts);
 
 /**
  * Wait until transcoding terminates or the specified timeout elapses.
@@ -147,7 +147,8 @@ int sch_stop(Scheduler *sch, int64_t *finish_ts);
  * @retval 0 waiting timed out, transcoding is not finished
  * @retval 1 transcoding is finished
  */
-int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts);
+int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts,
+             int64_t *transcode_ts_copyts);
 
 /**
  * Add a demuxer to the scheduler.
