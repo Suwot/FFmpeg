@@ -3358,6 +3358,9 @@ static int matroska_read_header(AVFormatContext *s)
     res = ebml_parse(matroska, matroska_segments, matroska);
     // Try resyncing until we find an EBML_STOP type element.
     while (res != 1) {
+        /* Avoid reparsing a successfully completed Segment during resync. */
+        if (res == 0)
+            pos = avio_tell(matroska->ctx->pb);
         res = matroska_resync(matroska, pos);
         if (res < 0)
             return res;
